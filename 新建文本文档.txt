@@ -189,7 +189,391 @@ DNAT 片段参考：
 
 修正 allocate_ip 内的 Python used = {{1}} 占位为 used = {1}（或验证该处在最终脚本中是正确的），以防语法/逻辑失败。
 
+一、确定存在的真实 BUG（严重）
+1️⃣ Python 代码 used = {{1}} 是错误语法
 
+在 _wg::allocate_ip() 内嵌 Python 中：
+
+used = {{1}}  # 中转机自身占用 .1
+
+这是 无效 Python 语法。
+
+Python set 正确写法：
+
+used = {1}
+
+{{1}} 只在 f-string模板转义 中才会出现。
+
+但这里 不是 f-string。
+
+结果：
+
+SyntaxError: invalid syntax
+
+这会导致：
+
+WG IP 分配脚本直接失败
+
+duijie.sh 中断
+
+这是 100%需要修复的BUG。
+
+2️⃣ nodes.json 并发写入仍然存在竞态
+
+你修复了：
+
+peer_map.json
+
+但 nodes.json 没有加锁。
+
+Python代码：
+
+nd.setdefault("nodes", {})[link_id] = entry
+with open(nodes_path,"w") as f:
+    json.dump(nd,f)
+
+并发运行两个 duijie.sh 时可能：
+
+进程A读取 nodes.json
+进程B读取 nodes.json
+A写入
+B写入
+
+结果：
+
+A的数据丢失
+
+建议：
+
+fcntl.flock
+tmp + os.replace
+
+和 peer_map 一样。
+
+3️⃣ heredoc 仍然有未修复的安全问题
+
+虽然你在注释写了：
+
+<< 'SHEOF'
+
+但实际脚本里 很多 heredoc 仍然是未加引号的。
+
+例如：
+
+_ssh::pipe << SHEOF
+
+这种情况：
+
+变量会 在本地展开。
+
+如果变量中出现：
+
+$(command)
+`command`
+$var
+
+就可能发生问题。
+
+我统计到：
+
+未加引号 heredoc
+≈ 10+ 处
+
+建议统一：
+
+<< 'SHEOF'
+
+然后：
+
+bash -s -- "$arg1" "$arg2"
+4️⃣ iptables DNAT + MASQUERADE 逻辑存在设计风险
+
+脚本中：
+
+PREROUTING DNAT -> WG_IP
+POSTROUTING MASQUERADE -d WG_IP/32 -o wg0
+
+规则：
+
+iptables -t nat -A POSTROUTING \
+    -d "${WG_IP}/32" -o wg0 \
+    -j MASQUERADE
+
+这意味着：
+
+源IP 被改写为 10.100.0.1
+
+落地机看到：
+
+client = 10.100.0.1
+
+影响：
+
+Xray 无法获得真实客户端IP
+
+geoip / 防刷 / 日志失真
+
+虽然连接仍然可用，但这是 设计级副作用。
+
+如果你想保留真实IP：
+
+应该使用：
+
+SNAT --to-source relay_public_ip
+
+或者：
+
+不SNAT
+落地机策略路由回WG
+5️⃣ set -euo pipefail + grep 管道可能导致脚本误退出
+
+例如类似逻辑：
+
+iptables -t nat -S PREROUTING | grep comment
+
+如果：
+
+grep 没找到
+
+返回码：
+
+1
+
+在：
+
+set -e
+
+情况下会导致：
+
+脚本退出
+
+必须写成：
+
+grep ... || true
+
+或：
+
+if grep -q ...
+
+这个问题在 iptables 删除规则模块 非常常见。
+
+二、逻辑层风险（中等）
+6️⃣ DNAT 同时对 TCP / UDP
+
+脚本：
+
+-p tcp
+-p udp
+
+Reality / VLESS 通常：
+
+TCP
+
+UDP DNAT 可能：
+
+不必要
+
+增加 attack surface
+
+建议：
+
+只开 TCP
+
+除非使用：
+
+VLESS + UDP
+7️⃣ wg set 动态 peer 但没有持久化
+
+脚本使用：
+
+wg set wg0 peer ...
+
+问题：
+
+重启后 peer 消失
+
+除非：
+
+wg-quick save
+
+或：
+
+写入 wg0.conf
+
+否则：
+
+reboot → 节点失效
+
+需要确认你是否：
+
+wg syncconf
+8️⃣ peer_map.json IP 回收可能冲突
+
+删除节点时：
+
+释放 IP
+
+但 未检查 wg0 当前 peer
+
+可能出现：
+
+peer_map: IP 已释放
+wg0: 仍存在 peer
+
+下一节点：
+
+IP 冲突
+
+建议：
+
+删除 peer 时：
+
+wg set wg0 peer <key> remove
+9️⃣ nodes.json 冲突检测不完整
+
+你只检测：
+
+同 IP + port
+
+但没有检测：
+
+同 LINK_ID
+
+如果：
+
+IP改变
+
+可能重复记录。
+
+10️⃣ mktemp fallback 不安全
+
+看到：
+
+mktemp || /tmp/.wg_key_$$
+
+$$ 可预测。
+
+安全版本：
+
+mktemp -p /tmp duijie.XXXXXX
+三、潜在网络问题（真实部署会遇到）
+11️⃣ MTU 探测仅测试 ICMP
+
+但真实流量：
+
+TCP + TLS
+
+路径 MTU 不一定一致。
+
+可能：
+
+ICMP可过
+TCP被丢
+
+建议：
+
+最终 MTU：
+
+min(detected, 1420)
+12️⃣ WireGuard keepalive 未设置
+
+若落地机在 NAT 后：
+
+WG 会断
+
+建议：
+
+PersistentKeepalive = 25
+四、代码质量问题（建议优化）
+13️⃣ JSON 解析全部靠 Python
+
+很好，但：
+
+异常未全部捕获
+
+例如：
+
+json.load()
+14️⃣ bash 函数命名 ::
+
+虽然可用，但：
+
+某些 shellcheck / dash 不兼容
+
+不过你明确使用 bash，可以接受。
+
+15️⃣ iptables 规则重复问题
+
+脚本每次：
+
+iptables -A
+
+如果删除逻辑失败：
+
+规则会叠加。
+
+建议：
+
+iptables -C
+
+存在再跳过。
+
+五、架构级建议（不是BUG）
+
+你的架构：
+
+Client
+   ↓
+Relay (DNAT)
+   ↓
+WireGuard
+   ↓
+Luodi
+   ↓
+Internet
+
+这是 很好的设计。
+
+优点：
+
+relay 不处理 TLS
+
+CPU 压力小
+
+Reality 在落地
+
+但可以再优化：
+
+① relay 不需要 MASQUERADE
+
+通过：
+
+policy routing
+
+落地机回程：
+
+via wg0
+
+即可保留真实IP。
+
+② relay firewall 建议只允许
+RELAY_PORT
+WireGuard
+SSH
+
+其它 drop。
+
+六、最关键的 5 个必须修复的问题
+
+优先级排序：
+
+级别	问题
+严重	used={{1}} Python语法错误
+严重	nodes.json 并发写入
+高	heredoc 未全部加引号
+高	iptables grep + set -e 退出
+中	wg peer 未持久化
 
 统一 sysctl 写入位置（全部使用 /etc/sysctl.d/99-duijie.conf），避免对 /etc/sysctl.conf 的并行修改。
+
 
