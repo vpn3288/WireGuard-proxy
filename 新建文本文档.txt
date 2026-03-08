@@ -1,0 +1,195 @@
+【项目】CN2GIA中转机（境外）+ WireGuard隧道 + N台落地机（境外）。 用户流量：中国→中转机→WireGuard隧道→落地机→互联网。 访问外网显示落地机IP，不显示中转机IP。 【4个脚本】zhongzhuan.sh（中转机初始化）/ luodi.sh（落地机信息收集）/ duijie.sh（核心对接脚本，单文件，_模块::函数()命名空间）/ fanghuoqiang.sh（防火墙）。 【约束】无BBR逻辑 / 固定节点不自动切换 / 单文件curl部署 / SSH heredoc远端执行。 【当前问题】duijie.sh。详细架构见项目说明文档。
+
+发现的风险 / 建议修复（按优先级）
+重要（应尽快修复或确认）
+1) Heredoc 使用不一致 — 存在注入/本地展开风险
+
+问题：在主流程中使用了 _ssh::pipe << SHEOF（未使用单引号），示例片段：_ssh::pipe << SHEOF 并在 heredoc 中直接插入了 LINK_ID 等变量（这些变量在本地被展开然后发送到中转机）。脚本头部的 FIX-2 明确建议使用 << 'SHEOF' + bash -s -- args 模式以防止本地展开；但实际主流程仍然使用不带引号的 heredoc。请见：远端执行片段示例。
+
+duijie_wg_v4.0
+
+风险与说明：
+
+如果某些变量（例如从落地机读取的公钥/域名）包含意想不到的字符（比如反引号、命令替换、特殊 shell 扩展等），未加引号的 heredoc 会导致本地先展开、再发往远端，从而产生注入或意外解释。
+
+虽然脚本对大多数字段来源是可信（例如来自自己机器或 luodi.sh），良好实践仍应消除理论注入面。
+
+建议修复
+
+将所有通过 _ssh::pipe 发送多行远端脚本的地方改为使用 _ssh::pipe_args + 单引号 heredoc。示意：
+
+# 本地传参（示例）
+_ssh::pipe_args "$LINK_ID" "$RELAY_ASSIGNED_PORT" "$LUODI_WG_ASSIGNED_IP" << 'REMOTE_EOF'
+LINK_ID="$1"
+RELAY_PORT="$2"
+WG_IP="$3"
+# … 剩余脚本使用 $LINK_ID/$RELAY_PORT/$WG_IP，不会被本地 shell 展开
+REMOTE_EOF
+
+如果因为便利仍要用 _ssh::pipe << EOF，则确保所有变量都经过严格的 shell-escaping（麻烦且容易出错），所以优先改为 pipe_args 为最佳。
+
+引用脚本中已经实现的安全函数 _ssh::pipe_args()：
+
+duijie_wg_v4.0
+
+2) /etc/sysctl 写入不一致（局部回归）
+
+问题：_info::read_relay() 已改为在中转机写入 /etc/sysctl.d/99-duijie.conf（推荐做法），但在你发往中转机的远端 heredoc 有一段直接修改 /etc/sysctl.conf（sed -i '/net\.ipv4\.ip_forward/d' /etc/sysctl.conf → append），见引用。这在脚本中存在不一致：一个位置写入 /etc/sysctl.d/99-duijie.conf（更规范），另一个位置回退到直接改 /etc/sysctl.conf，导致混乱与可维护性问题。
+
+duijie_wg_v4.0
+
+ 
+
+duijie_wg_v4.0
+
+风险
+
+维护不一致，升级或清理时可能残留旧配置。
+
+/etc/sysctl.conf 修改可能与发行版的 system-managed files 冲突。
+
+建议修复
+
+统一使用 /etc/sysctl.d/99-duijie.conf：在远端 heredoc 里替换对 /etc/sysctl.conf 的修改为写入 /etc/sysctl.d/99-duijie.conf 并 sysctl --system 或 sysctl -q -w net.ipv4.ip_forward=1。例如：
+
+echo 'net.ipv4.ip_forward=1' > /etc/sysctl.d/99-duijie.conf
+chmod 644 /etc/sysctl.d/99-duijie.conf
+sysctl --system || sysctl -q -w net.ipv4.ip_forward=1
+
+或在脚本开头统一一个函数 _sysctl::enable_ip_forward() 并在所有地方调用。
+
+引用：_info::read_relay() 中的做法已很好（使用 /etc/sysctl.d），建议主流程也一致。
+
+duijie_wg_v4.0
+
+3) _wg::allocate_ip Python 片段中疑似模板/占位错误 used = {{1}}
+
+问题：在 allocate_ip 的 Python 内嵌脚本片段中，我看到 used = {{1}} 这样的片段（双大括号），示例见引用片段（used = {{1}} # 中转机自身占用 .1）。这看起来像模板替换遗留或转义问题（正确应为 used = {1}，即 Python 的 set 初始化），否则 Python 会报语法错误或逻辑错误。
+
+duijie_wg_v4.0
+
+风险
+
+如果脚本中确实是 {{1}}，Python 解析会失败，导致 IP 分配模块异常中止，从而阻断对接流程。
+
+建议修复
+
+确认最终内嵌 Python 源码里的那一行确实为：
+
+used = {1}  # 中转机自身占用 .1
+
+如果脚本是通过 shell 拼接 Python 字符串产生，检查转义与引号，避免双大括号误判。你可以在运行前做 python3 -m py_compile 或在脚本中对该内嵌段做 python3 -c '…' 的语法测试。
+
+引用分配函数位置：
+
+duijie_wg_v4.0
+
+4) 回滚与原子性策略欠缺（部分成功 / 部分失败时需回滚）
+
+问题：脚本步骤包括：分配 WG IP → 在中转机添加 WG peer → 在落地机配置本地 wg0 → 分配外部端口 → 写 iptables DNAT。若任一步失败（例如 iptables 写入失败或中转机重启），脚本里没有完整的回滚步骤来撤销已经添加的 peer、还原 peer_map、清除部分 iptables 规则等（我在主流程与各模块没有看到一个集中式的 on_error 回滚逻辑）。
+
+风险
+
+当脚本在中间失败，系统会残留半成品（peer 已加入但 DNAT 未写入），造成难以排查的状态并占用 WG IP / 端口资源。
+
+建议
+
+实现一个简单的事务/回滚策略：
+
+在每一步成功后记录回滚动作（例如 push 到数组 ROLLBACK_CMDS）。
+
+在 trap '...' ERR EXIT 中调用回滚命令（逆序执行）。
+
+最小集合示例：
+
+如果 _wg::add_peer 成功，回滚应执行 wg set wg0 peer <pubkey> remove 或删除该 peer 的配置并重启 wg。
+
+如果 DNAT 写入成功但验证失败，回滚应删除 DNAT 注释为 luodi-dnat-<LINK_ID> 的规则，并删除 peer_map 映射（或恢复旧值）。
+
+在 --auto 模式可选择是否在失败时自动回滚或保留以便人工排查。
+
+中等（应当修正/强化）
+5) peer_map 读写锁策略审查（读时没有锁）
+
+说明：save_peer_map() 已使用 flock + os.replace；load_peer_map() 只是直接 open(peer_map_path)。在 POSIX 上，os.replace() 保证原子替换，所以读操作不会看到半写文件；因此整体方案是合理的。但有两点建议：
+
+duijie_wg_v4.0
+
+建议：
+
+保持 load_peer_map() 在打开文件时捕获 json.JSONDecodeError 并重试短时间（例如 0.1s、最多 5 次），以防万一读到旧文件或竞争时出现 I/O 短暂异常。
+
+文件权限 600 已设置，良好。
+
+6) port 分配（_port::allocate）与 race 条件
+
+我在引用里未看到 _port::allocate 的实现片段（未返回到结果中），请确认该模块是否：
+
+使用 ss -ltnp 或 ss -lunp 精确检测端口冲突；
+
+在分配端口时考虑并发（例如两个落地机同时请求端口）——应避免直接写入一个公共 nodes.json 时发生 race；
+
+如果 nodes.json 做写操作，是否使用原子替换 + 持久化（与 peer_map 相同策略）。
+
+建议
+
+使用和 peer_map 相同的原子写入策略写入 nodes.json（临时文件 + os.replace），并在分配端口时检测重复（重试若检测到端口被占用）。
+
+优化 / 建议（可提升可维护性）
+7) MTU 探测的健壮性与替代方案
+
+脚本在中转机侧检测 ping -M do 是否支持（FIX-4），并在不可用时回退到保底 1380。这很好。但建议：
+
+若 ping -M do 不可用并且 tracepath 可用，可尝试 tracepath 获得 PMTU（tracepath 在某些系统上更常见且不依赖 -M do）。
+
+若使用域名且解析多 A 记录，建议先解析到 IP 再探测（脚本已说明，但提醒确保解析一致性）。
+
+相关片段在脚本 MTU 探测处（未完全展开在引用中，参见主流程 MTU 调用）。
+
+
+8) iptables 规则删除与匹配的健壮性
+
+脚本使用 _del_rules_by_comment() 通过 iptables -t nat -S PREROUTING | grep -- "\"${COMMENT}\"" 等命令反向删除（把 -A 改 -D），总体思路可行，但注意：
+
+iptables -S 输出格式在不同实现上可能略有差异（iptables-nft 输出仍然有双引号吗？），建议在删除时：
+
+首先尝试基于 -m comment --comment "<comment>" -j 的删除方式构造规则，或者
+
+使用 iptables-save + parse/过滤 + iptables-restore 的方式做原子替换（更复杂但更可靠）。
+
+已有脚本对 nft 后端仅做提示（good），仍建议对删除逻辑做更强鲁棒性测试（在 iptables-nft 环境下实际演练）。
+
+引用 _fw::dnat_add 检测 nft 的段落。
+
+
+9) 密码泄露 / 记忆体残留
+
+脚本如果使用密码认证（sshpass），会在内存/环境中短暂保存 RELAY_SSH_PASS。建议：
+
+在验证通过后立即 unset RELAY_SSH_PASS 或将其清空 RELAY_SSH_PASS=''（仍需 sshpass 在命令执行期间使用，但之后清理变量）。
+
+避免将密码写入持久文件或日志。
+
+相关片段在 _ssh::setup() 中。
+
+
+10) IPv6 漏洞/泄漏空白
+
+脚本注释中提到有“IPv6泄漏防护”，但在引用的 DNAT 片段里看不到 ip6tables 的对应规则（片段里主要是 IPv4 的 DNAT / MASQUERADE）。建议确认并在需要时：
+
+在中转机上拒绝或正确处理与 WG 走向相关的 IPv6 数据包（例如通过 ip6tables 或禁止 IPv6 转发），以防从落地机经 IPv6 直接外出导致使用中转机 IP 之外的出口 IP 泄漏。
+
+DNAT 片段参考：
+
+
+
+小结：我认为必须优先修复的三项
+
+全面替换当前不带引号的 heredoc 用法为 _ssh::pipe_args + 单引号 heredoc（防止本地展开注入）。
+
+修正 allocate_ip 内的 Python used = {{1}} 占位为 used = {1}（或验证该处在最终脚本中是正确的），以防语法/逻辑失败。
+
+
+
+统一 sysctl 写入位置（全部使用 /etc/sysctl.d/99-duijie.conf），避免对 /etc/sysctl.conf 的并行修改。
+
