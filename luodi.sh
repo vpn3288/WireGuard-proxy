@@ -71,6 +71,9 @@ LUODI_WG_PRIVKEY=""
 LUODI_BACKEND_TYPE=""
 LUODI_SOURCE_FILE=""
 
+# user_decision 返回值（避免命令替换捕获菜单输出的问题）
+_USER_ACTION=""
+
 # 上次对接记录（来自 info.txt 中 duijie.sh 写入的段落）
 _SAVED_RELAY_IP=""
 _SAVED_RELAY_SSH_PORT="22"
@@ -1047,14 +1050,16 @@ user_decision() {
     read -rp "  请选择 [1]: " choice || true
     choice="${choice:-1}"
 
+    # 注意：此函数直接在父 shell 中调用（非命令替换），
+    # 通过全局变量 _USER_ACTION 返回结果，exit 可正常退出主脚本。
     case "$choice" in
         1)  log_info "使用现有配置，仅刷新 IP 和 export.json..."
-            echo "reuse" ;;
+            _USER_ACTION="reuse" ;;
         2)  log_info "重新读取代理参数（保留 WG 密钥）..."
-            echo "refresh" ;;
-        3)  echo "full_reset" ;;
+            _USER_ACTION="refresh" ;;
+        3)  _USER_ACTION="full_reset" ;;
         4)  log_info "已退出"; exit 0 ;;
-        *)  log_warn "无效选择，使用现有配置"; echo "reuse" ;;
+        *)  log_warn "无效选择，使用现有配置"; _USER_ACTION="reuse" ;;
     esac
 }
 
@@ -1687,7 +1692,8 @@ main() {
         _load_existing_params 2>/dev/null || true
 
         _show_existing_summary "$state"
-        action=$(user_decision "$state")
+        user_decision "$state"
+        action="$_USER_ACTION"
     fi
 
     # ── 执行决策 ─────────────────────────────────────────────────────
