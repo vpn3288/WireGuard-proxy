@@ -273,17 +273,11 @@ try_sniff_mack_xray() {
     local search_files=()
 
     if [[ -d "$conf_dir" ]]; then
-        # mack-a 惯例：Reality Vision 在 04_* 文件
+        # 扫描目录内所有 json 文件，由 Python 层按 security 字段过滤
+        # 不限文件名，避免 xhttp/tls 等配置因文件名不含 reality 而漏检
         while IFS= read -r f; do
             search_files+=("$f")
-        done < <(ls "${conf_dir}/"*reality*".json" "${conf_dir}/04_"*".json" \
-                    "${conf_dir}/"*Reality*".json" 2>/dev/null | sort -u || true)
-        # 兜底：扫描所有 json
-        if [[ ${#search_files[@]} -eq 0 ]]; then
-            while IFS= read -r f; do
-                search_files+=("$f")
-            done < <(ls "${conf_dir}/"*.json 2>/dev/null || true)
-        fi
+        done < <(ls "${conf_dir}/"*.json 2>/dev/null | sort || true)
     fi
     [[ -f "$alt_conf" ]] && search_files+=("$alt_conf")
 
@@ -966,7 +960,7 @@ confirm_params() {
         _fix() {
             local label="$1" var="$2"
             read -rp "  ${label} [${!var}]: " i || true
-            [[ -n "$i" ]] && printf -v "$var" '%s' "$i"
+            if [[ -n "$i" ]]; then printf -v "$var" '%s' "$i"; fi
         }
 
         _fix "落地机 IP"   LUODI_IP
