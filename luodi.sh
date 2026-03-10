@@ -71,9 +71,6 @@ LUODI_WG_PRIVKEY=""
 LUODI_BACKEND_TYPE=""
 LUODI_SOURCE_FILE=""
 
-# user_decision 返回值（避免命令替换捕获菜单输出的问题）
-_USER_ACTION=""
-
 # 上次对接记录（来自 info.txt 中 duijie.sh 写入的段落）
 _SAVED_RELAY_IP=""
 _SAVED_RELAY_SSH_PORT="22"
@@ -84,7 +81,7 @@ _SAVED_RELAY_SSH_USER="root"
 # ══════════════════════════════════════════════════════════════════════
 
 check_root() {
-    [[ $EUID -ne 0 ]] && log_error "请使用 root 权限运行"
+    if [[ $EUID -ne 0 ]]; then log_error "请使用 root 权限运行"; fi
     command -v python3 &>/dev/null || log_error "python3 未找到，请安装: apt-get install -y python3"
 }
 
@@ -188,7 +185,7 @@ manage_wg_keys() {
     echo "$LUODI_WG_PUBKEY" > "$WG_PUB_FILE"
     chmod 644 "$WG_PUB_FILE"
 
-    [[ -z "$LUODI_WG_PRIVKEY" || -z "$LUODI_WG_PUBKEY" ]] && log_error "WireGuard 密钥生成失败"
+    if [[ -z "$LUODI_WG_PRIVKEY" || -z "$LUODI_WG_PUBKEY" ]]; then log_error "WireGuard 密钥生成失败"; fi
     log_info "WG 密钥对已生成（公钥: ${LUODI_WG_PUBKEY:0:20}...）"
 }
 
@@ -273,15 +270,21 @@ try_sniff_mack_xray() {
     local search_files=()
 
     if [[ -d "$conf_dir" ]]; then
-        # 扫描目录下全部 .json，Python 侧自行过滤 Reality inbound
-        # 不限制文件名模式，避免漏扫 07_* / 16_* 等非惯例命名文件
+        # mack-a 惯例：Reality Vision 在 04_* 文件
         while IFS= read -r f; do
             search_files+=("$f")
-        done < <(ls "${conf_dir}/"*.json 2>/dev/null | sort -V || true)
+        done < <(ls "${conf_dir}/"*reality*".json" "${conf_dir}/04_"*".json" \
+                    "${conf_dir}/"*Reality*".json" 2>/dev/null | sort -u || true)
+        # 兜底：扫描所有 json
+        if [[ ${#search_files[@]} -eq 0 ]]; then
+            while IFS= read -r f; do
+                search_files+=("$f")
+            done < <(ls "${conf_dir}/"*.json 2>/dev/null || true)
+        fi
     fi
     [[ -f "$alt_conf" ]] && search_files+=("$alt_conf")
 
-    [[ ${#search_files[@]} -eq 0 ]] && return 1
+    if [[ ${#search_files[@]} -eq 0 ]]; then return 1; fi
 
     local sniff_result
     sniff_result=$(python3 - "${search_files[@]}" << 'PYEOF'
@@ -605,7 +608,7 @@ PYEOF
         local i
         read -rp "Reality 公钥（base64）: " i || true
         LUODI_PUBKEY="$i"
-        [[ -z "$LUODI_PUBKEY" ]] && log_error "Reality 公钥不能为空"
+        if [[ -z "$LUODI_PUBKEY" ]]; then log_error "Reality 公钥不能为空"; fi
     fi
 
     LUODI_BACKEND_TYPE="$backend"
@@ -626,7 +629,7 @@ try_sniff_xui_3xui() {
     for db in "${db_paths[@]}"; do
         [[ -f "$db" ]] && { found_db="$db"; break; }
     done
-    [[ -z "$found_db" ]] && return 1
+    if [[ -z "$found_db" ]]; then return 1; fi
 
     command -v sqlite3 &>/dev/null || {
         log_warn "检测到 x-ui 数据库，但 sqlite3 未安装"
@@ -775,13 +778,13 @@ fallback_manual_input() {
     }
 
     LUODI_PORT=$(_ask_field "代理端口（Xray/Sing-box 监听端口）" "")
-    [[ -z "$LUODI_PORT" ]] && log_error "代理端口不能为空"
+    if [[ -z "$LUODI_PORT" ]]; then log_error "代理端口不能为空"; fi
 
     LUODI_UUID=$(_ask_field "UUID" "")
-    [[ -z "$LUODI_UUID" ]] && log_error "UUID 不能为空"
+    if [[ -z "$LUODI_UUID" ]]; then log_error "UUID 不能为空"; fi
 
     LUODI_PUBKEY=$(_ask_field "Reality 公钥（base64）" "")
-    [[ -z "$LUODI_PUBKEY" ]] && log_error "Reality 公钥不能为空"
+    if [[ -z "$LUODI_PUBKEY" ]]; then log_error "Reality 公钥不能为空"; fi
 
     LUODI_SHORTID=$(_ask_field "Short ID（十六进制，可为空）" "")
     LUODI_SNI=$(_ask_field "SNI（伪装域名）" "www.microsoft.com")
@@ -916,7 +919,7 @@ confirm_params() {
         _fix() {
             local label="$1" var="$2"
             read -rp "  ${label} [${!var}]: " i || true
-            [[ -n "$i" ]] && printf -v "$var" '%s' "$i" || true
+            [[ -n "$i" ]] && printf -v "$var" '%s' "$i"
         }
 
         _fix "落地机 IP"   LUODI_IP
@@ -930,10 +933,10 @@ confirm_params() {
     fi
 
     # 最终校验必填字段
-    [[ -z "$LUODI_PORT"   ]] && log_error "代理端口不能为空"
-    [[ -z "$LUODI_UUID"   ]] && log_error "UUID 不能为空"
-    [[ -z "$LUODI_PUBKEY" ]] && log_error "Reality 公钥不能为空"
-    [[ -z "$LUODI_SNI"    ]] && log_error "SNI 不能为空"
+    if [[ -z "$LUODI_PORT"   ]]; then log_error "代理端口不能为空"; fi
+    if [[ -z "$LUODI_UUID"   ]]; then log_error "UUID 不能为空"; fi
+    if [[ -z "$LUODI_PUBKEY" ]]; then log_error "Reality 公钥不能为空"; fi
+    if [[ -z "$LUODI_SNI"    ]]; then log_error "SNI 不能为空"; fi
 }
 
 # ══════════════════════════════════════════════════════════════════════
@@ -1050,16 +1053,14 @@ user_decision() {
     read -rp "  请选择 [1]: " choice || true
     choice="${choice:-1}"
 
-    # 注意：此函数直接在父 shell 中调用（非命令替换），
-    # 通过全局变量 _USER_ACTION 返回结果，exit 可正常退出主脚本。
     case "$choice" in
         1)  log_info "使用现有配置，仅刷新 IP 和 export.json..."
-            _USER_ACTION="reuse" ;;
+            echo "reuse" ;;
         2)  log_info "重新读取代理参数（保留 WG 密钥）..."
-            _USER_ACTION="refresh" ;;
-        3)  _USER_ACTION="full_reset" ;;
+            echo "refresh" ;;
+        3)  echo "full_reset" ;;
         4)  log_info "已退出"; exit 0 ;;
-        *)  log_warn "无效选择，使用现有配置"; _USER_ACTION="reuse" ;;
+        *)  log_warn "无效选择，使用现有配置"; echo "reuse" ;;
     esac
 }
 
@@ -1692,8 +1693,7 @@ main() {
         _load_existing_params 2>/dev/null || true
 
         _show_existing_summary "$state"
-        user_decision "$state"
-        action="$_USER_ACTION"
+        action=$(user_decision "$state")
     fi
 
     # ── 执行决策 ─────────────────────────────────────────────────────
