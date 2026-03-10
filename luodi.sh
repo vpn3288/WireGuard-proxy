@@ -30,6 +30,7 @@
 # ══════════════════════════════════════════════════════════════════════
 
 set -euo pipefail
+trap 'echo -e "\033[0;31m[✗]\033[0m 脚本在第 $LINENO 行意外退出，请检查上方错误信息" >&2' ERR
 
 # ══════════════════════════════════════════════════════════════════════
 # §0  颜色 & 日志
@@ -66,6 +67,8 @@ LUODI_XHTTP_MODE="auto"
 LUODI_WS_PATH="/"
 LUODI_WS_HOST=""
 LUODI_GRPC_SERVICE=""
+LUODI_SECURITY="reality"
+LUODI_FLOW=""
 LUODI_WG_PUBKEY=""
 LUODI_WG_PRIVKEY=""
 LUODI_BACKEND_TYPE=""
@@ -317,7 +320,7 @@ def load_jsonc(path):
     except: return json.loads(raw)
 
 files = sys.argv[1:]
-results = []  # list of (port, uuid_list, pubkey, shortid_list, sni, network, extra, path)
+results = []
 
 for fpath in files:
     try:
@@ -334,62 +337,95 @@ for fpath in files:
         port = ib.get('port', 0)
         stream = ib.get('streamSettings', {}) or {}
         security = stream.get('security', '')
-        if security != 'reality':
+
+        # 接受 reality / tls / xtls 三种安全层（tls/xtls 对应 Vision 证书方案）
+        if security not in ('reality', 'tls', 'xtls'):
             continue
-        rs = stream.get('realitySettings', {}) or {}
-        pubkey = rs.get('publicKey', '') or rs.get('dest', '')
-        if not pubkey or not rs.get('publicKey'):
-            continue
-        pubkey = rs.get('publicKey', '')
-        shortids = rs.get('shortIds', []) or [rs.get('shortId', '')]
-        sni = rs.get('serverNames', [''])[0] if rs.get('serverNames') else ''
+
+        # ── Reality 参数 ──────────────────────────────────────────
+        pubkey = ''; shortids = ['']; sni = ''
+        if security == 'reality':
+            rs = stream.get('realitySettings', {}) or {}
+            pubkey = rs.get('publicKey', '')
+            if not pubkey:
+                continue   # Reality 入站没有公钥则无意义
+            shortids = rs.get('shortIds', []) or [rs.get('shortId', '')]
+            shortids = [s for s in shortids if s] or ['']
+            sni = rs.get('serverNames', [''])[0] if rs.get('serverNames') else ''
+
+        # ── TLS / XTLS 参数 ───────────────────────────────────────
+        else:
+            ts_key = 'tlsSettings' if security == 'tls' else 'xtlsSettings'
+            ts  = stream.get(ts_key, {}) or {}
+            sni = ts.get('serverName', '')
+            pubkey   = ''   # TLS Vision 走证书，无 Reality 公钥
+            shortids = ['']
+
+        # ── 传输层 ────────────────────────────────────────────────
         network = stream.get('network', 'tcp')
         extra = {}
         if network == 'xhttp':
             xh = stream.get('xhttpSettings', {}) or {}
-            extra = {'xhttp_path': xh.get('path','/'), 'xhttp_host': xh.get('host',''), 'xhttp_mode': xh.get('mode','auto')}
+            extra = {'xhttp_path': xh.get('path', '/'),
+                     'xhttp_host': xh.get('host', ''),
+                     'xhttp_mode': xh.get('mode', 'auto')}
         elif network == 'ws':
-            ws = stream.get('wsSettings', {}) or {}
+            ws  = stream.get('wsSettings', {}) or {}
             hdr = ws.get('headers', {}) or {}
-            extra = {'ws_path': ws.get('path','/'), 'ws_host': hdr.get('Host', ws.get('host',''))}
-        elif network == 'grpc':
+            extra = {'ws_path': ws.get('path', '/'),
+                     'ws_host': hdr.get('Host', ws.get('host', ''))}
+        elif network in ('grpc', 'gun'):
             gr = stream.get('grpcSettings', {}) or {}
-            extra = {'grpc_service': gr.get('serviceName','')}
-        # collect UUIDs
-        uuids = []
+            extra = {'grpc_service': gr.get('serviceName', '')}
+        elif network == 'h2':
+            h2      = stream.get('httpSettings', {}) or {}
+            host_h2 = h2.get('host', [''])[0] if h2.get('host') else sni
+            extra   = {'ws_path': h2.get('path', '/'), 'ws_host': host_h2}
+
+        # ── flow / Vision 标记 ────────────────────────────────────
+        flow     = ''
         settings = ib.get('settings', {}) or {}
+        uuids    = []
         for client in settings.get('clients', []):
             uid = client.get('id', '')
-            if uid: uuids.append(uid)
+            if uid:
+                uuids.append(uid)
+                if not flow:
+                    flow = client.get('flow', '')
         if not uuids:
             continue
-        shortids_clean = [s for s in shortids if s] or ['']
-        results.append({'port': port, 'uuids': uuids, 'pubkey': pubkey,
-                        'shortids': shortids_clean, 'sni': sni, 'network': network,
-                        'extra': extra, 'path': fpath})
+
+        results.append({
+            'port': port, 'uuids': uuids, 'pubkey': pubkey,
+            'shortids': shortids, 'sni': sni, 'network': network,
+            'security': security, 'flow': flow,
+            'extra': extra, 'path': fpath,
+        })
 
 if not results:
     print('NOTFOUND')
     sys.exit(0)
 
-def _emit(r, idx=None):
-    prefix = f"R{idx}:" if idx is not None else ""
+def _emit(r, idx):
     e = r.get('extra', {})
-    print(f"{prefix}PORT={r['port']}")
-    print(f"{prefix}PUBKEY={r['pubkey']}")
-    print(f"{prefix}SNI={r['sni']}")
-    print(f"{prefix}NETWORK={r['network']}")
-    print(f"{prefix}PATH={r['path']}")
-    print(f"{prefix}UUIDS={'|'.join(r['uuids'])}")
-    print(f"{prefix}SHORTIDS={'|'.join(r['shortids'])}")
-    print(f"{prefix}XHTTP_PATH={e.get('xhttp_path','/')}")
-    print(f"{prefix}XHTTP_HOST={e.get('xhttp_host','')}")
-    print(f"{prefix}XHTTP_MODE={e.get('xhttp_mode','auto')}")
-    print(f"{prefix}WS_PATH={e.get('ws_path','/')}")
-    print(f"{prefix}WS_HOST={e.get('ws_host','')}")
-    print(f"{prefix}GRPC_SERVICE={e.get('grpc_service','')}")
+    p = f"R{idx}:"
+    print(f"{p}PORT={r['port']}")
+    print(f"{p}PUBKEY={r['pubkey']}")
+    print(f"{p}SNI={r['sni']}")
+    print(f"{p}NETWORK={r['network']}")
+    print(f"{p}SECURITY={r['security']}")
+    print(f"{p}FLOW={r.get('flow','')}")
+    print(f"{p}PATH={r['path']}")
+    print(f"{p}UUIDS={'|'.join(r['uuids'])}")
+    print(f"{p}SHORTIDS={'|'.join(r['shortids'])}")
+    print(f"{p}XHTTP_PATH={e.get('xhttp_path','/')}")
+    print(f"{p}XHTTP_HOST={e.get('xhttp_host','')}")
+    print(f"{p}XHTTP_MODE={e.get('xhttp_mode','auto')}")
+    print(f"{p}WS_PATH={e.get('ws_path','/')}")
+    print(f"{p}WS_HOST={e.get('ws_host','')}")
+    print(f"{p}GRPC_SERVICE={e.get('grpc_service','')}")
 
-print(f"FOUND")
+print("FOUND")
 print(f"COUNT={len(results)}")
 for i, r in enumerate(results):
     _emit(r, i)
@@ -405,16 +441,22 @@ PYEOF
 
     if [[ "$count" -gt 1 ]]; then
         echo ""
-        echo -e "  ${CYAN}检测到 ${count} 个 Reality 入站配置，请选择用于中转的那个：${NC}"
+        echo -e "  ${CYAN}检测到 ${count} 个代理入站配置，请选择用于中转的那个：${NC}"
         echo ""
         local ci
         for (( ci=0; ci<count; ci++ )); do
-            local _p _sni _net _src
-            _p=$(echo   "$sniff_result" | grep -m1 "^R${ci}:PORT=" | cut -d= -f2-)
-            _sni=$(echo "$sniff_result" | grep -m1 "^R${ci}:SNI="  | cut -d= -f2-)
-            _net=$(echo "$sniff_result" | grep -m1 "^R${ci}:NETWORK=" | cut -d= -f2-)
-            _src=$(echo "$sniff_result" | grep -m1 "^R${ci}:PATH=" | cut -d= -f2- | xargs basename 2>/dev/null || true)
-            echo -e "  [$(( ci+1 ))] 端口 ${_p:-?}  SNI: ${_sni:-?}  协议: ${_net:-tcp}  文件: ${_src:-?}"
+            local _p _sni _net _sec _flow _src _label
+            _p=$(echo    "$sniff_result" | grep -m1 "^R${ci}:PORT="     | cut -d= -f2-)
+            _sni=$(echo  "$sniff_result" | grep -m1 "^R${ci}:SNI="      | cut -d= -f2-)
+            _net=$(echo  "$sniff_result" | grep -m1 "^R${ci}:NETWORK="  | cut -d= -f2-)
+            _sec=$(echo  "$sniff_result" | grep -m1 "^R${ci}:SECURITY=" | cut -d= -f2-)
+            _flow=$(echo "$sniff_result" | grep -m1 "^R${ci}:FLOW="     | cut -d= -f2-)
+            _src=$(echo  "$sniff_result" | grep -m1 "^R${ci}:PATH="     | cut -d= -f2- | xargs basename 2>/dev/null || true)
+            # 生成可读标签：security + flow + network
+            _label="${_sec:-?}"
+            [[ "$_flow" == *"vision"* ]] && _label="${_label}+Vision"
+            _label="${_label}/${_net:-tcp}"
+            echo -e "  [$(( ci+1 ))] 端口 ${_p:-?}  类型: ${_label}  SNI: ${_sni:-?}  文件: ${_src:-?}"
         done
         echo ""
         local sel
@@ -446,6 +488,8 @@ PYEOF
     LUODI_WS_PATH=$(_kv WS_PATH)
     LUODI_WS_HOST=$(_kv WS_HOST)
     LUODI_GRPC_SERVICE=$(_kv GRPC_SERVICE)
+    LUODI_SECURITY=$(_kv SECURITY)
+    LUODI_FLOW=$(_kv FLOW)
 
     # UUID 多选
     _select_uuid "$uuids_raw"
@@ -682,33 +726,49 @@ for row in rows:
     remark, port, proto, settings_raw, stream_raw = row
     if proto.lower() not in ('vless', 'vmess'): continue
 
-    stream = try_parse(stream_raw) or {}
+    stream   = try_parse(stream_raw) or {}
     security = stream.get('security', '')
-    if security != 'reality': continue
+    if security not in ('reality', 'tls', 'xtls'): continue
 
     settings = try_parse(settings_raw) or {}
-    clients = settings.get('clients', []) or []
-    uuids = [c.get('id','') for c in clients if c.get('id')]
+    clients  = settings.get('clients', []) or []
+    flow = ''
+    uuids = []
+    for c in clients:
+        uid = c.get('id', '')
+        if uid:
+            uuids.append(uid)
+            if not flow: flow = c.get('flow', '')
     if not uuids: continue
 
-    rs = stream.get('realitySettings', {}) or {}
-    pubkey = rs.get('publicKey','')
-    if not pubkey: continue
+    pubkey = ''; shortids = ['']; sni = ''
+    if security == 'reality':
+        rs      = stream.get('realitySettings', {}) or {}
+        pubkey  = rs.get('publicKey', '')
+        if not pubkey: continue
+        shortids = rs.get('shortIds', []) or [rs.get('shortId', '')]
+        shortids = [s for s in shortids if s] or ['']
+        sni     = rs.get('serverNames', [''])[0] if rs.get('serverNames') else ''
+    else:
+        ts_key = 'tlsSettings' if security == 'tls' else 'xtlsSettings'
+        ts  = stream.get(ts_key, {}) or {}
+        sni = ts.get('serverName', '')
 
-    shortids = rs.get('shortIds', []) or [rs.get('shortId','')]
-    sni = rs.get('serverNames',[''])[0] if rs.get('serverNames') else ''
-    network = stream.get('network','tcp')
+    network = stream.get('network', 'tcp')
     extra = {}
     if network == 'xhttp':
-        xh = stream.get('xhttpSettings',{}) or {}
-        extra = {'xhttp_path': xh.get('path','/'), 'xhttp_host': xh.get('host',''), 'xhttp_mode': xh.get('mode','auto')}
+        xh = stream.get('xhttpSettings', {}) or {}
+        extra = {'xhttp_path': xh.get('path', '/'), 'xhttp_host': xh.get('host', ''), 'xhttp_mode': xh.get('mode', 'auto')}
     elif network == 'ws':
-        ws = stream.get('wsSettings',{}) or {}
-        hdr = ws.get('headers',{}) or {}
-        extra = {'ws_path': ws.get('path','/'), 'ws_host': hdr.get('Host',ws.get('host',''))}
-    elif network == 'grpc':
-        gr = stream.get('grpcSettings',{}) or {}
-        extra = {'grpc_service': gr.get('serviceName','')}
+        ws  = stream.get('wsSettings', {}) or {}
+        hdr = ws.get('headers', {}) or {}
+        extra = {'ws_path': ws.get('path', '/'), 'ws_host': hdr.get('Host', ws.get('host', ''))}
+    elif network in ('grpc', 'gun'):
+        gr = stream.get('grpcSettings', {}) or {}
+        extra = {'grpc_service': gr.get('serviceName', '')}
+    elif network == 'h2':
+        h2 = stream.get('httpSettings', {}) or {}
+        extra = {'ws_path': h2.get('path', '/'), 'ws_host': (h2.get('host') or [''])[0]}
 
     shortids_clean = [s for s in shortids if s] or ['']
     print("FOUND")
@@ -717,6 +777,8 @@ for row in rows:
     print(f"R0:PUBKEY={pubkey}")
     print(f"R0:SNI={sni}")
     print(f"R0:NETWORK={network}")
+    print(f"R0:SECURITY={security}")
+    print(f"R0:FLOW={flow}")
     print(f"R0:PATH={db_path}")
     print(f"R0:UUIDS={'|'.join(uuids)}")
     print(f"R0:SHORTIDS={'|'.join(shortids_clean)}")
@@ -900,6 +962,7 @@ confirm_params() {
     echo -e "  SNI         : ${LUODI_SNI}"
     echo -e "  Short ID    : ${LUODI_SHORTID:-（空）}"
     echo -e "  传输协议    : ${LUODI_NETWORK}"
+    echo -e "  安全层      : ${LUODI_SECURITY}${LUODI_FLOW:+  (flow: $LUODI_FLOW)}"
     [[ "$LUODI_NETWORK" == "xhttp" ]] && echo -e "  XHTTP Path  : ${LUODI_XHTTP_PATH}"
     [[ "$LUODI_NETWORK" == "ws"    ]] && echo -e "  WS Path     : ${LUODI_WS_PATH}"
     [[ "$LUODI_NETWORK" == "grpc"  ]] && echo -e "  gRPC Service: ${LUODI_GRPC_SERVICE}"
@@ -1287,49 +1350,70 @@ REMOTE_EOF
 save_export_json() {
     local timestamp; timestamp=$(date -u '+%Y-%m-%dT%H:%M:%SZ')
 
-    python3 - "$LUODI_IP" "$LUODI_PORT" "$LUODI_UUID" \
-             "$LUODI_PUBKEY" "$LUODI_SNI" "$LUODI_SHORTID" \
-             "$LUODI_NETWORK" "$LUODI_XHTTP_PATH" "$LUODI_XHTTP_HOST" \
-             "$LUODI_XHTTP_MODE" "$LUODI_WS_PATH" "$LUODI_WS_HOST" \
-             "$LUODI_GRPC_SERVICE" "$LUODI_WG_PUBKEY" \
-             "$LUODI_BACKEND_TYPE" "$LUODI_SOURCE_FILE" \
-             "$timestamp" "$LUODI_VERSION" "$EXPORT_JSON" << 'PYEOF'
-import json, sys
-(ip, port, uuid, pubkey, sni, shortid,
- network, xhttp_path, xhttp_host, xhttp_mode,
- ws_path, ws_host, grpc_service, wg_pubkey,
- backend_type, source_file, timestamp, version, out_path) = sys.argv[1:]
+    # 变量通过环境变量传入 Python，完全规避特殊字符 / 参数数量不匹配问题
+    local result
+    result=$(
+        LUODI_IP="$LUODI_IP" LUODI_PORT="$LUODI_PORT" LUODI_UUID="$LUODI_UUID" \
+        LUODI_PUBKEY="$LUODI_PUBKEY" LUODI_SNI="$LUODI_SNI" LUODI_SHORTID="$LUODI_SHORTID" \
+        LUODI_NETWORK="$LUODI_NETWORK" LUODI_XHTTP_PATH="$LUODI_XHTTP_PATH" \
+        LUODI_XHTTP_HOST="$LUODI_XHTTP_HOST" LUODI_XHTTP_MODE="$LUODI_XHTTP_MODE" \
+        LUODI_WS_PATH="$LUODI_WS_PATH" LUODI_WS_HOST="$LUODI_WS_HOST" \
+        LUODI_GRPC_SERVICE="$LUODI_GRPC_SERVICE" LUODI_SECURITY="$LUODI_SECURITY" LUODI_FLOW="$LUODI_FLOW" LUODI_WG_PUBKEY="$LUODI_WG_PUBKEY" \
+        LUODI_BACKEND_TYPE="$LUODI_BACKEND_TYPE" LUODI_SOURCE_FILE="$LUODI_SOURCE_FILE" \
+        TS="$timestamp" VER="$LUODI_VERSION" OUT="$EXPORT_JSON" \
+        python3 - << 'PYEOF'
+import json, os, sys
+
+def e(k, default=''):
+    return os.environ.get(k, default)
+
+port_raw = e('LUODI_PORT', '0')
+try:    port_val = int(port_raw)
+except: port_val = port_raw
 
 data = {
-    "version": version,
-    "generated_at": timestamp,
+    "version": e('VER'),
+    "generated_at": e('TS'),
     "nodes": [{
-        "ip":           ip,
-        "port":         int(port) if port.isdigit() else port,
-        "uuid":         uuid,
-        "pubkey":       pubkey,
-        "sni":          sni,
-        "shortid":      shortid,
-        "network":      network,
-        "xhttp_path":   xhttp_path,
-        "xhttp_host":   xhttp_host,
-        "xhttp_mode":   xhttp_mode,
-        "ws_path":      ws_path,
-        "ws_host":      ws_host,
-        "grpc_service": grpc_service,
-        "wg_pubkey":    wg_pubkey,
+        "ip":           e('LUODI_IP'),
+        "port":         port_val,
+        "uuid":         e('LUODI_UUID'),
+        "pubkey":       e('LUODI_PUBKEY'),
+        "sni":          e('LUODI_SNI'),
+        "shortid":      e('LUODI_SHORTID'),
+        "network":      e('LUODI_NETWORK', 'tcp'),
+        "xhttp_path":   e('LUODI_XHTTP_PATH', '/'),
+        "xhttp_host":   e('LUODI_XHTTP_HOST'),
+        "xhttp_mode":   e('LUODI_XHTTP_MODE', 'auto'),
+        "ws_path":      e('LUODI_WS_PATH', '/'),
+        "ws_host":      e('LUODI_WS_HOST'),
+        "grpc_service": e('LUODI_GRPC_SERVICE'),
+        "security":     e('LUODI_SECURITY', 'reality'),
+        "flow":         e('LUODI_FLOW'),
+        "wg_pubkey":    e('LUODI_WG_PUBKEY'),
         "wg_ip":        "",
-        "backend_type": backend_type,
-        "source_file":  source_file,
+        "backend_type": e('LUODI_BACKEND_TYPE'),
+        "source_file":  e('LUODI_SOURCE_FILE'),
     }]
 }
-with open(out_path, "w", encoding="utf-8") as f:
-    json.dump(data, f, indent=2, ensure_ascii=False)
-print(f"[OK] {out_path}")
+out_path = e('OUT', '/tmp/luodi_export.json')
+try:
+    with open(out_path, 'w', encoding='utf-8') as f:
+        json.dump(data, f, indent=2, ensure_ascii=False)
+    print(f"OK:{out_path}")
+except Exception as ex:
+    print(f"FAIL:{ex}", file=sys.stderr)
+    sys.exit(1)
 PYEOF
+    ) || { echo -e "\033[0;31m[✗]\033[0m export.json 写入失败" >&2; exit 1; }
 
-    chmod 600 "$EXPORT_JSON"
-    log_info "export.json 已写入: $EXPORT_JSON"
+    if echo "$result" | grep -q "^OK:"; then
+        chmod 600 "$EXPORT_JSON"
+        log_info "export.json 已写入: $EXPORT_JSON"
+    else
+        echo -e "\033[0;31m[✗]\033[0m export.json 写入异常: $result" >&2
+        exit 1
+    fi
 }
 
 save_info() {
@@ -1374,6 +1458,8 @@ LUODI_XHTTP_MODE=${LUODI_XHTTP_MODE}
 LUODI_WS_PATH=${LUODI_WS_PATH}
 LUODI_WS_HOST=${LUODI_WS_HOST}
 LUODI_GRPC_SERVICE=${LUODI_GRPC_SERVICE}
+LUODI_SECURITY=${LUODI_SECURITY}
+LUODI_FLOW=${LUODI_FLOW}
 LUODI_WG_PUBKEY=${LUODI_WG_PUBKEY}
 LUODI_WG_PRIVKEY=${LUODI_WG_PRIVKEY}
 LUODI_BACKEND_TYPE=${LUODI_BACKEND_TYPE}
@@ -1741,10 +1827,11 @@ main() {
             ;;
 
         full_reset)
-            # 选项 3 / --reset：完全重置（do_full_reset 已执行清理）
+            # 选项 3：先执行完全重置（备份旧密钥、停 wg0、询问 SSH 清理中转机）
+            do_full_reset
             LUODI_IP=$(get_public_ip)
             install_wireguard
-            manage_wg_keys "false"  # 旧密钥已删除，此时会生成新密钥
+            manage_wg_keys "false"  # 旧密钥已删除，generate_wg_keys 生成新密钥
             sniff_proxy_params
             confirm_params
             save_export_json
